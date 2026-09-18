@@ -23,6 +23,11 @@ from aiogram.types import (
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 
 
 # =========================================================
@@ -71,14 +76,17 @@ SUBSCRIPTION_PREFIX = os.getenv(
 
 # GitHub
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+
 GITHUB_OWNER = os.getenv(
     "GITHUB_OWNER",
     "bdtvyz76b6-blip"
 )
+
 GITHUB_REPO = os.getenv(
     "GITHUB_REPO",
     "vpn-sub"
 )
+
 GITHUB_BRANCH = os.getenv(
     "GITHUB_BRANCH",
     "main"
@@ -507,13 +515,6 @@ def get_payment(payment_id):
 
 
 def process_paid_payment(payment_id):
-    """
-    Единственное место, где платёж превращается
-    в дни подписки.
-
-    Повторный webhook второй раз дни НЕ начислит.
-    """
-
     with db() as conn:
         with conn.cursor() as cur:
 
@@ -729,7 +730,6 @@ def save_user_subscription(
         filename
     )
 
-    # Если файл уже есть — обновляем.
     if sha:
         return github_put_file(
             filename,
@@ -738,7 +738,6 @@ def save_user_subscription(
             f"Update ixxy subscription {user_id}"
         )
 
-    # Если файла нет — создаём.
     return github_put_file(
         filename,
         content,
@@ -810,11 +809,13 @@ def sync_all_users():
         try:
             user_id = user["user_id"]
 
+            update_subscription_file(
+                user_id
+            )
+
             if subscription_active(user):
-                update_subscription_file(user_id)
                 result["updated"] += 1
             else:
-                update_subscription_file(user_id)
                 result["expired"] += 1
 
         except Exception:
@@ -981,29 +982,27 @@ dp = Dispatcher()
 # =========================================================
 
 def home_keyboard():
-    rows = [
-        [
-            InlineKeyboardButton(
-                text="☂️ Моя подписка",
-                callback_data="cabinet"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="💳 Купить подписку",
-                callback_data="buy"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="🎁 Промокод",
-                callback_data="promo"
-            )
-        ]
-    ]
-
     return InlineKeyboardMarkup(
-        inline_keyboard=rows
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="☂️ Моя подписка",
+                    callback_data="cabinet"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💳 Купить подписку",
+                    callback_data="buy"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎁 Промокод",
+                    callback_data="promo"
+                )
+            ]
+        ]
     )
 
 
@@ -1099,6 +1098,12 @@ def admin_keyboard():
             ],
             [
                 InlineKeyboardButton(
+                    text="📢 Рассылка",
+                    callback_data="admin_broadcast"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="🔄 Синхронизация",
                     callback_data="admin_sync"
                 )
@@ -1121,8 +1126,13 @@ class PromoState(StatesGroup):
     waiting_code = State()
 
 
-class SearchState(StatesGroup):
+class AdminSearchState(StatesGroup):
     waiting_query = State()
+
+
+class BroadcastState(StatesGroup):
+    waiting_message = State()
+    waiting_confirm = State()
 
 
 # =========================================================
@@ -1674,6 +1684,10 @@ async def cmd_admin(
     )
 
 
+# =========================================================
+# ADMIN STATS
+# =========================================================
+
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(
     callback: CallbackQuery
@@ -1697,6 +1711,7 @@ async def admin_stats(
                     COUNT(*) AS count
                 FROM payments
             """)
+
             total_payments = cur.fetchone()["count"]
 
             cur.execute("""
@@ -1706,6 +1721,7 @@ async def admin_stats(
                 FROM payments
                 WHERE status='paid'
             """)
+
             row = cur.fetchone()
 
     await callback.message.edit_text(
@@ -1720,6 +1736,10 @@ async def admin_stats(
 
     await callback.answer()
 
+
+# =========================================================
+# ADMIN USERS
+# =========================================================
 
 @dp.callback_query(F.data == "admin_users")
 async def admin_users(
@@ -1762,6 +1782,10 @@ async def admin_users(
     await callback.answer()
 
 
+# =========================================================
+# ADMIN PAYMENTS
+# =========================================================
+
 @dp.callback_query(F.data == "admin_payments")
 async def admin_payments(
     callback: CallbackQuery
@@ -1777,6 +1801,7 @@ async def admin_payments(
                 ORDER BY created_at DESC
                 LIMIT 30
             """)
+
             payments = cur.fetchall()
 
     text = "💳 <b>Последние платежи</b>\n\n"
@@ -1809,10 +1834,6 @@ async def admin_payments(
 # =========================================================
 # ADMIN SEARCH
 # =========================================================
-
-class AdminSearchState(StatesGroup):
-    waiting_query = State()
-
 
 @dp.callback_query(F.data == "admin_search")
 async def admin_search_start(
@@ -1892,6 +1913,63 @@ async def admin_search_result(
 
 
 # =========================================================
+# ADMIN PROMOCODES
+# =========================================================
+
+@dp.callback_query(F.data == "admin_promos")
+async def admin_promos(
+    callback: CallbackQuery
+):
+    if not is_admin(callback.from_user.id):
+        return
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT *
+                FROM promocodes
+                ORDER BY created_at DESC
+                LIMIT 50
+            """)
+
+            promos = cur.fetchall()
+
+    text = "🎟 <b>Промокоды</b>\n\n"
+
+    for promo in promos:
+        status = (
+            "🟢"
+            if promo["active"]
+            else "🔴"
+        )
+
+        text += (
+            f"{status} "
+            f"<code>{promo['code']}</code> — "
+            f"{promo['days']} дн.\n"
+        )
+
+    if not promos:
+        text += (
+            "Промокодов нет.\n\n"
+            "Создать:\n"
+            "<code>/promo CODE DAYS</code>"
+        )
+    else:
+        text += (
+            "\nСоздать новый:\n"
+            "<code>/promo CODE DAYS</code>"
+        )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================================================
 # ADMIN SYNC
 # =========================================================
 
@@ -1920,6 +1998,540 @@ async def admin_sync(
     )
 
     await callback.answer()
+
+
+# =========================================================
+# 📢 BROADCAST
+# =========================================================
+
+def get_user_ids_for_broadcast():
+    users = get_all_users() or []
+
+    result = []
+
+    for user in users:
+
+        if not isinstance(user, dict):
+            continue
+
+        user_id = user.get("user_id")
+
+        if user_id is None:
+            continue
+
+        try:
+            result.append(int(user_id))
+        except (TypeError, ValueError):
+            continue
+
+    return list(dict.fromkeys(result))
+
+
+def broadcast_confirm_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Начать рассылку",
+                    callback_data="broadcast_confirm"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data="broadcast_cancel"
+                )
+            ]
+        ]
+    )
+
+
+# =========================================================
+# НАЧАЛО РАССЫЛКИ
+# =========================================================
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def start_broadcast(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    if not callback.from_user:
+        return
+
+    if not is_admin(callback.from_user.id):
+        await callback.answer(
+            "❌ Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    await state.clear()
+
+    await state.set_state(
+        BroadcastState.waiting_message
+    )
+
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    await callback.message.answer(
+        "📢 <b>Создание рассылки</b>\n\n"
+        "Отправь сообщение, которое нужно "
+        "разослать пользователям.\n\n"
+        "Поддерживается:\n"
+        "• текст\n"
+        "• фото с подписью\n"
+        "• видео с подписью\n"
+        "• документ с подписью\n\n"
+        "После отправки будет предпросмотр "
+        "и подтверждение.\n\n"
+        "Для отмены отправь /cancel.",
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# ПОЛУЧЕНИЕ СООБЩЕНИЯ ДЛЯ РАССЫЛКИ
+# =========================================================
+
+@dp.message(BroadcastState.waiting_message)
+async def prepare_broadcast(
+    message: Message,
+    state: FSMContext
+):
+    if not message.from_user:
+        return
+
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    if message.text == "/cancel":
+        await state.clear()
+
+        await message.answer(
+            "❌ Рассылка отменена."
+        )
+
+        return
+
+    supported = any([
+        bool(message.text),
+        bool(message.photo),
+        bool(message.video),
+        bool(message.document)
+    ])
+
+    if not supported:
+        await message.answer(
+            "⚠️ Этот тип сообщения "
+            "не поддерживается.\n\n"
+            "Отправь текст, фото, видео "
+            "или документ."
+        )
+        return
+
+    try:
+        users = await asyncio.to_thread(
+            get_user_ids_for_broadcast
+        )
+
+    except Exception as e:
+        log.exception(
+            "Broadcast get users error"
+        )
+
+        await message.answer(
+            "❌ Не удалось получить "
+            "список пользователей.\n\n"
+            f"<code>{type(e).__name__}</code>",
+            parse_mode="HTML"
+        )
+
+        return
+
+    await state.update_data(
+        message_id=message.message_id,
+        chat_id=message.chat.id,
+        users_count=len(users)
+    )
+
+    await state.set_state(
+        BroadcastState.waiting_confirm
+    )
+
+    await message.answer(
+        "📢 <b>Предпросмотр рассылки</b>\n\n"
+        f"👥 Получателей: <b>{len(users)}</b>\n\n"
+        "Сообщение выше будет отправлено "
+        "всем пользователям.\n\n"
+        "Начать рассылку?",
+        parse_mode="HTML",
+        reply_markup=broadcast_confirm_keyboard()
+    )
+
+
+# =========================================================
+# ПОДТВЕРЖДЕНИЕ РАССЫЛКИ
+# =========================================================
+
+@dp.callback_query(F.data == "broadcast_confirm")
+async def confirm_broadcast(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    if not callback.from_user:
+        return
+
+    if not is_admin(callback.from_user.id):
+        await callback.answer(
+            "❌ Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    data = await state.get_data()
+
+    message_id = data.get("message_id")
+    chat_id = data.get("chat_id")
+
+    if message_id is None or chat_id is None:
+        await state.clear()
+
+        await callback.answer(
+            "❌ Сообщение для рассылки "
+            "не найдено.",
+            show_alert=True
+        )
+
+        return
+
+    try:
+        users = await asyncio.to_thread(
+            get_user_ids_for_broadcast
+        )
+
+    except Exception as e:
+        await state.clear()
+
+        await callback.answer(
+            "❌ Ошибка.",
+            show_alert=True
+        )
+
+        if callback.message:
+            await callback.message.answer(
+                "❌ Не удалось получить "
+                "список пользователей.\n\n"
+                f"<code>{type(e).__name__}</code>",
+                parse_mode="HTML"
+            )
+
+        return
+
+    total = len(users)
+
+    if total == 0:
+        await state.clear()
+
+        await callback.answer(
+            "Пользователей нет.",
+            show_alert=True
+        )
+
+        if callback.message:
+            await callback.message.answer(
+                "⚠️ Пользователей для "
+                "рассылки нет."
+            )
+
+        return
+
+    await callback.answer(
+        "📢 Рассылка запущена"
+    )
+
+    if not callback.message:
+        await state.clear()
+        return
+
+    status_message = await callback.message.answer(
+        "📢 <b>Рассылка запущена</b>\n\n"
+        f"👥 Получателей: <b>{total}</b>\n"
+        "⏳ Обработка...",
+        parse_mode="HTML"
+    )
+
+    # Используем основной экземпляр бота.
+    current_bot = callback.bot
+
+    sent = 0
+    failed = 0
+    blocked = 0
+
+    try:
+
+        for index, user_id in enumerate(
+            users,
+            start=1
+        ):
+
+            success = False
+
+            try:
+
+                await current_bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=chat_id,
+                    message_id=message_id
+                )
+
+                sent += 1
+                success = True
+
+            except TelegramRetryAfter as e:
+
+                retry_after = (
+                    int(e.retry_after) + 1
+                )
+
+                log.warning(
+                    "Broadcast rate limit: "
+                    "sleep %ss",
+                    retry_after
+                )
+
+                await asyncio.sleep(
+                    retry_after
+                )
+
+                try:
+
+                    await current_bot.copy_message(
+                        chat_id=user_id,
+                        from_chat_id=chat_id,
+                        message_id=message_id
+                    )
+
+                    sent += 1
+                    success = True
+
+                except TelegramForbiddenError:
+
+                    failed += 1
+                    blocked += 1
+
+                except TelegramBadRequest as retry_error:
+
+                    failed += 1
+
+                    log.warning(
+                        "Broadcast retry bad request: %r",
+                        retry_error
+                    )
+
+                except Exception as retry_error:
+
+                    failed += 1
+
+                    log.warning(
+                        "Broadcast retry error: %r",
+                        retry_error
+                    )
+
+            except TelegramForbiddenError:
+
+                failed += 1
+                blocked += 1
+
+            except TelegramBadRequest as e:
+
+                failed += 1
+
+                log.warning(
+                    "Broadcast bad request: %r",
+                    e
+                )
+
+            except Exception as e:
+
+                failed += 1
+
+                log.exception(
+                    "Broadcast send error "
+                    "user=%s",
+                    user_id
+                )
+
+            # -------------------------------------------------
+            # ПРОГРЕСС
+            # -------------------------------------------------
+
+            if (
+                index % 20 == 0
+                or index == total
+            ):
+
+                try:
+
+                    progress = (
+                        index * 100 // total
+                    )
+
+                    await status_message.edit_text(
+                        "📢 <b>Рассылка выполняется</b>\n\n"
+                        f"📨 Обработано: "
+                        f"<b>{index}/{total}</b>\n"
+                        f"📊 Прогресс: "
+                        f"<b>{progress}%</b>\n\n"
+                        f"✅ Отправлено: "
+                        f"<b>{sent}</b>\n"
+                        f"❌ Ошибок: "
+                        f"<b>{failed}</b>\n"
+                        f"🚫 Заблокировали: "
+                        f"<b>{blocked}</b>",
+                        parse_mode="HTML"
+                    )
+
+                except Exception:
+                    pass
+
+            # Небольшая пауза,
+            # чтобы не упираться в лимиты Telegram.
+            if success:
+                await asyncio.sleep(0.08)
+            else:
+                await asyncio.sleep(0.05)
+
+    finally:
+        pass
+
+    await state.clear()
+
+    # ---------------------------------------------------------
+    # ИТОГ
+    # ---------------------------------------------------------
+
+    try:
+
+        await status_message.edit_text(
+            "📢 <b>Рассылка завершена</b>\n\n"
+            f"👥 Всего пользователей: "
+            f"<b>{total}</b>\n\n"
+            f"✅ Отправлено: "
+            f"<b>{sent}</b>\n"
+            f"❌ Ошибок: "
+            f"<b>{failed}</b>\n"
+            f"🚫 Заблокировали бота: "
+            f"<b>{blocked}</b>",
+            parse_mode="HTML"
+        )
+
+    except Exception:
+
+        try:
+
+            await callback.message.answer(
+                "📢 <b>Рассылка завершена</b>\n\n"
+                f"👥 Всего пользователей: "
+                f"<b>{total}</b>\n\n"
+                f"✅ Отправлено: "
+                f"<b>{sent}</b>\n"
+                f"❌ Ошибок: "
+                f"<b>{failed}</b>\n"
+                f"🚫 Заблокировали бота: "
+                f"<b>{blocked}</b>",
+                parse_mode="HTML"
+            )
+
+        except Exception:
+            pass
+
+
+# =========================================================
+# ОТМЕНА РАССЫЛКИ КНОПКОЙ
+# =========================================================
+
+@dp.callback_query(F.data == "broadcast_cancel")
+async def cancel_broadcast(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    if not callback.from_user:
+        return
+
+    if not is_admin(callback.from_user.id):
+        await callback.answer(
+            "❌ Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    await state.clear()
+
+    await callback.answer(
+        "Рассылка отменена."
+    )
+
+    if callback.message:
+
+        try:
+
+            await callback.message.edit_text(
+                "❌ <b>Рассылка отменена.</b>",
+                parse_mode="HTML"
+            )
+
+        except TelegramBadRequest:
+            pass
+
+
+# =========================================================
+# ОТМЕНА /cancel ВО ВРЕМЯ РАССЫЛКИ
+# =========================================================
+
+@dp.message(
+    BroadcastState.waiting_message,
+    F.text == "/cancel"
+)
+async def cancel_broadcast_message(
+    message: Message,
+    state: FSMContext
+):
+    if not message.from_user:
+        return
+
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    await state.clear()
+
+    await message.answer(
+        "❌ Рассылка отменена."
+    )
+
+
+@dp.message(
+    BroadcastState.waiting_confirm,
+    F.text == "/cancel"
+)
+async def cancel_broadcast_confirm(
+    message: Message,
+    state: FSMContext
+):
+    if not message.from_user:
+        return
+
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    await state.clear()
+
+    await message.answer(
+        "❌ Рассылка отменена."
+    )
 
 
 # =========================================================
@@ -2056,7 +2668,8 @@ async def cmd_promo(
 
     if days <= 0:
         await message.answer(
-            "❌ Количество дней должно быть больше 0."
+            "❌ Количество дней должно быть "
+            "больше 0."
         )
         return
 
@@ -2074,6 +2687,7 @@ async def cmd_promo(
                     code,
                     days
                 ))
+
             conn.commit()
 
         await message.answer(
@@ -2099,12 +2713,9 @@ BOT_LOOP = None
 
 
 def verify_cashera_webhook():
-    """
-    Проверяем секрет только если он задан.
-    API key также принимаем как дополнительную проверку.
-    """
 
     if CASHERA_API_SECRET:
+
         secret = (
             request.headers.get("X-Secret")
             or request.headers.get("X-Api-Secret")
@@ -2131,13 +2742,17 @@ def health():
     })
 
 
-@app.route("/webhook/cashera", methods=["POST"])
+@app.route(
+    "/webhook/cashera",
+    methods=["POST"]
+)
 def cashera_webhook():
 
     if not verify_cashera_webhook():
         return "Forbidden", 403
 
     try:
+
         data = request.get_json(
             silent=True
         ) or {}
@@ -2162,7 +2777,10 @@ def cashera_webhook():
             transaction = merged
 
         status = str(
-            transaction.get("status", "")
+            transaction.get(
+                "status",
+                ""
+            )
         ).lower()
 
         if status != "paid":
@@ -2206,13 +2824,12 @@ def cashera_webhook():
         if currency != "RUB":
             return "OK", 200
 
-        # CasheRa может вернуть amount
-        # в копейках.
         amount = transaction.get(
             "amount"
         )
 
         if amount is not None:
+
             try:
                 amount = int(
                     float(amount)
@@ -2255,8 +2872,6 @@ def cashera_webhook():
         user_id = result["user_id"]
         days = result["days"]
 
-        # Обновляем GitHub только после
-        # успешного начисления.
         update_subscription_file(
             user_id
         )
@@ -2274,12 +2889,13 @@ def cashera_webhook():
             until
         )
 
-        # Уведомление пользователя.
         if (
             BOT_LOOP
             and not result["already_paid"]
         ):
+
             try:
+
                 asyncio.run_coroutine_threadsafe(
                     bot.send_message(
                         user_id,
@@ -2294,6 +2910,7 @@ def cashera_webhook():
                     ),
                     BOT_LOOP
                 )
+
             except Exception:
                 log.exception(
                     "Payment notification error"
@@ -2302,13 +2919,11 @@ def cashera_webhook():
         return "OK", 200
 
     except Exception:
+
         log.exception(
             "CasheRa webhook error"
         )
 
-        # Возвращаем 200, чтобы CasheRa
-        # не заспамила webhook повторными
-        # запросами при неизвестной ошибке.
         return "OK", 200
 
 
@@ -2317,9 +2932,11 @@ def cashera_webhook():
 # =========================================================
 
 async def subscription_checker():
+
     while True:
 
         try:
+
             await asyncio.to_thread(
                 expire_old_subscriptions
             )
@@ -2329,12 +2946,16 @@ async def subscription_checker():
             )
 
             for user in users:
+
                 try:
+
                     await asyncio.to_thread(
                         update_subscription_file,
                         user["user_id"]
                     )
+
                 except Exception:
+
                     log.exception(
                         "Subscription update "
                         "failed user=%s",
@@ -2342,6 +2963,7 @@ async def subscription_checker():
                     )
 
         except Exception:
+
             log.exception(
                 "Subscription checker error"
             )
@@ -2354,6 +2976,7 @@ async def subscription_checker():
 # =========================================================
 
 def run_flask():
+
     app.run(
         host="0.0.0.0",
         port=PORT,
@@ -2367,11 +2990,14 @@ def run_flask():
 # =========================================================
 
 async def main():
+
     global BOT_LOOP
 
     BOT_LOOP = asyncio.get_running_loop()
 
-    log.info("☂️ ixxy VPN starting")
+    log.info(
+        "☂️ ixxy VPN starting"
+    )
 
     await asyncio.to_thread(
         init_db
@@ -2386,11 +3012,13 @@ async def main():
     )
 
     try:
+
         await dp.start_polling(
             bot
         )
 
     finally:
+
         checker.cancel()
 
         try:
@@ -2400,6 +3028,10 @@ async def main():
 
         await bot.session.close()
 
+
+# =========================================================
+# START
+# =========================================================
 
 if __name__ == "__main__":
 
